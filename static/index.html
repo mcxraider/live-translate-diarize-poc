@@ -30,6 +30,7 @@
 <body>
 <header>
   <label>From <select id="src"></select></label>
+  <button id="swap" type="button" title="Swap languages" aria-label="Swap languages">⇄</button>
   <label>To <select id="tgt"></select></label>
   <button id="toggle">Start</button>
   <label><input type="checkbox" id="mute"> Mute audio</label>
@@ -168,6 +169,11 @@ function stop(){
   if (statusEl.className !== "err") setStatus("idle");
 }
 $("toggle").onclick = () => running ? stop() : start();
+$("swap").onclick = () => {
+  const s = $("src").value;
+  $("src").value = $("tgt").value;
+  $("tgt").value = s;
+};
 </script>
 </body>
 </html>
