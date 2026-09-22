@@ -161,6 +161,7 @@ function stop(){
   running = false;
   $("toggle").textContent = "Start"; $("toggle").classList.remove("on");
   try { ws && ws.readyState === 1 && ws.send(JSON.stringify({ type:"session.finish" })); } catch {}
+  if (ws) ws.onclose = ws.onerror = null;  // stale close must not re-stop a restarted session
   try { ws && ws.close(); } catch {}
   proc && (proc.onaudioprocess = null, proc.disconnect());
   micStream && micStream.getTracks().forEach(t => t.stop());
@@ -169,11 +170,17 @@ function stop(){
   if (statusEl.className !== "err") setStatus("idle");
 }
 $("toggle").onclick = () => running ? stop() : start();
+// Language changes must reach the model, which only gets config at connect time.
+// Restart the session so start() re-sends the current source/target.
+function applyLangChange(){ if (running){ stop(); start(); } }
 $("swap").onclick = () => {
   const s = $("src").value;
   $("src").value = $("tgt").value;
   $("tgt").value = s;
+  applyLangChange();
 };
+$("src").onchange = applyLangChange;
+$("tgt").onchange = applyLangChange;
 </script>
 </body>
 </html>
