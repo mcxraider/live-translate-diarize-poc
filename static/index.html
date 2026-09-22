@@ -5,26 +5,37 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Qwen LiveTranslate — Diarisation POC</title>
 <style>
-  :root { --bg:#0f1115; --card:#181b22; --line:#262b36; --muted:#8b93a7; --fg:#e7eaf0; }
+  :root {
+    --bg:#f4f5f6; --card:#ffffff; --line:#e3e5e9; --muted:#6b7280; --fg:#1f2328;
+    --field:#ffffff; --field-hover:#f0f1f3; --btn:#2b2f36; --btn-fg:#ffffff;
+  }
   * { box-sizing: border-box; }
   body { margin:0; font:15px/1.5 system-ui, sans-serif; background:var(--bg); color:var(--fg); }
-  header { display:flex; gap:12px; align-items:center; flex-wrap:wrap;
-           padding:12px 16px; border-bottom:1px solid var(--line); background:#12151b; position:sticky; top:0; }
-  select, button { font:inherit; padding:6px 10px; border-radius:8px; border:1px solid var(--line);
-                   background:#1d222b; color:var(--fg); }
+  header { display:flex; justify-content:center; gap:10px; align-items:center; flex-wrap:wrap;
+           padding:16px; border-bottom:1px solid var(--line); background:var(--card);
+           box-shadow:0 1px 2px rgba(0,0,0,.04); position:sticky; top:0; z-index:1; }
+  select, button { font:inherit; padding:8px 12px; border-radius:10px; border:1px solid var(--line);
+                   background:var(--field); color:var(--fg); transition:background .12s, box-shadow .12s; }
+  select:hover, button:hover { background:var(--field-hover); }
+  select:focus-visible, button:focus-visible { outline:none; box-shadow:0 0 0 3px rgba(0,0,0,.08); }
   button { cursor:pointer; }
-  button#toggle { background:#2f6feb; border-color:#2f6feb; font-weight:600; }
-  button#toggle.on { background:#c23b3b; border-color:#c23b3b; }
+  button#swap { padding:8px 10px; line-height:1; }
+  button#toggle { background:var(--btn); border-color:var(--btn); color:var(--btn-fg); font-weight:600; }
+  button#toggle:hover { background:#1c2026; }
+  button#toggle.on { background:var(--field); border-color:#c9ccd2; color:var(--fg); }
+  button#toggle.on:hover { background:var(--field-hover); }
   label { color:var(--muted); display:flex; gap:6px; align-items:center; }
-  #status { margin-left:auto; color:var(--muted); font-size:13px; }
-  #status.err { color:#ff8080; }
-  main { max-width:820px; margin:0 auto; padding:16px; }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:12px 14px; margin:10px 0; }
+  #status { color:var(--muted); font-size:13px; padding:5px 12px; border-radius:999px;
+            background:var(--field-hover); border:1px solid var(--line); }
+  #status.err { color:#b4232a; border-color:#e6c7c9; background:#faf0f0; }
+  main { max-width:820px; margin:0 auto; padding:20px 16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px;
+          padding:14px 16px; margin:12px 0; box-shadow:0 1px 3px rgba(0,0,0,.05); }
   .badge { display:inline-block; font-size:12px; font-weight:700; color:#fff;
            padding:2px 10px; border-radius:999px; margin-bottom:8px; }
   .src { color:var(--muted); font-size:14px; }
   .tr  { font-size:17px; margin-top:4px; }
-  .hint { color:var(--muted); text-align:center; margin-top:40px; }
+  .hint { color:var(--muted); text-align:center; margin-top:48px; }
 </style>
 </head>
 <body>
@@ -44,7 +55,7 @@
 <script>
 const $ = id => document.getElementById(id);
 const statusEl = $("status"), logEl = $("log"), hintEl = $("hint");
-const PALETTE = ["#7c5cff","#2fb6c2","#3fb950","#e3a008","#e35d9a","#5a8dee"];
+const PALETTE = ["#2b2f36","#565c66","#7a828e","#3f4650","#6b7280","#4b5563"];
 
 // Singapore + regional set. (Tamil not offered by LiveTranslate.)
 const LANGS = {
