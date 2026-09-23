@@ -25,10 +25,17 @@
   button#toggle.on { background:var(--field); border-color:#c9ccd2; color:var(--fg); }
   button#toggle.on:hover { background:var(--field-hover); }
   label { color:var(--muted); display:flex; gap:6px; align-items:center; }
+  select:disabled, button:disabled { opacity:.45; cursor:not-allowed; }
+  .hinttag { color:var(--muted); font-size:12px; font-style:italic; }
   #status { color:var(--muted); font-size:13px; padding:5px 12px; border-radius:999px;
             background:var(--field-hover); border:1px solid var(--line); }
   #status.err { color:#b4232a; border-color:#e6c7c9; background:#faf0f0; }
   main { max-width:820px; margin:0 auto; padding:20px 16px; }
+  .cols { display:flex; gap:16px; }
+  .col { flex:1; min-width:0; }
+  .colhead { font-size:13px; font-weight:700; color:var(--muted); text-transform:uppercase;
+             letter-spacing:.04em; padding:0 2px 4px; }
+  @media (max-width:640px){ .cols { flex-direction:column; } }
   .card { background:var(--card); border:1px solid var(--line); border-radius:14px;
           padding:14px 16px; margin:12px 0; box-shadow:0 1px 3px rgba(0,0,0,.05); }
   .badge { display:inline-block; font-size:12px; font-weight:700; color:#fff;
@@ -40,7 +47,14 @@
 </head>
 <body>
 <header>
+  <label>Provider <select id="provider">
+    <option value="qwen">Qwen</option>
+    <option value="openai">OpenAI</option>
+    <option value="gemini">Gemini Live</option>
+    <option value="both">Both (compare)</option>
+  </select></label>
   <label>From <select id="src"></select></label>
+  <span id="srchint" class="hinttag" style="display:none">auto-detected</span>
   <button id="swap" type="button" title="Swap languages" aria-label="Swap languages">⇄</button>
   <label>To <select id="tgt"></select></label>
   <button id="toggle">Start</button>
@@ -69,129 +83,242 @@ function fillLangs(sel, def){
 fillLangs($("src"), "zh");
 fillLangs($("tgt"), "en");
 
-let ws, micCtx, micStream, proc, playCtx, running = false;
-let cur = null, curSpeaker = null, nextTime = 0;
-const speakerColors = new Map();
-
 function setStatus(t, err=false){ statusEl.textContent = t; statusEl.className = err ? "err" : ""; }
 
-function colorFor(speaker){
-  const key = speaker || "Speaker";
-  if (!speakerColors.has(key)) speakerColors.set(key, PALETTE[speakerColors.size % PALETTE.length]);
-  return speakerColors.get(key);
-}
-
-// --- utterance grouping ---------------------------------------------------
-// speaker_id arrives on its own "speaker" message (from speech_started) and
-// marks a new turn; source/translation deltas then fill the current card.
-function newCard(speaker){
-  const el = document.createElement("div");
-  el.className = "card";
-  const label = speaker == null ? "Speaker" : "Speaker " + speaker;
-  el.innerHTML = `<span class="badge" style="background:${colorFor(speaker)}">${label}</span>`
-               + `<div class="src"></div><div class="tr"></div>`;
-  logEl.appendChild(el);
-  hintEl.style.display = "none";
-  cur = { speaker, srcEl: el.querySelector(".src"), trEl: el.querySelector(".tr") };
-  el.scrollIntoView({ behavior:"smooth", block:"end" });
-  return cur;
-}
-const ensure = () => cur || newCard(curSpeaker);
-
-function handle(msg){
-  if (msg.kind === "speaker"){
-    curSpeaker = msg.speaker; newCard(curSpeaker);
-  } else if (msg.kind === "source"){
-    const c = ensure();
-    if (msg.final) c.srcEl.textContent = msg.text;   // completed = full transcript
-    else c.srcEl.textContent += msg.text;
-  } else if (msg.kind === "translation"){
-    ensure().trEl.textContent += msg.text;
-  } else if (msg.kind === "audio"){
-    if (!$("mute").checked) playChunk(msg.b64);
-  } else if (msg.kind === "status"){
-    if (msg.type === "response.done") cur = null;
-    else if (msg.type === "error") setStatus("server: " + JSON.stringify(msg.raw), true);
-  }
-}
-
-// --- audio playback (24kHz PCM16, sequential) -----------------------------
 function bytesFromB64(b64){
   const bin = atob(b64), out = new Uint8Array(bin.length);
   for (let i=0;i<bin.length;i++) out[i] = bin.charCodeAt(i);
   return out;
 }
-function playChunk(b64){
-  const i16 = new Int16Array(bytesFromB64(b64).buffer);
-  const buf = playCtx.createBuffer(1, i16.length, 24000);
-  const ch = buf.getChannelData(0);
-  for (let i=0;i<i16.length;i++) ch[i] = i16[i] / 32768;
-  const node = playCtx.createBufferSource();
-  node.buffer = buf; node.connect(playCtx.destination);
-  const t = Math.max(playCtx.currentTime, nextTime);
-  node.start(t); nextTime = t + buf.duration;
-}
-
-// --- mic capture -> 16kHz PCM16 base64 ------------------------------------
 function b64(buf){
   const bytes = new Uint8Array(buf); let s = "";
   for (let i=0;i<bytes.length;i+=0x8000) s += String.fromCharCode(...bytes.subarray(i, i+0x8000));
   return btoa(s);
 }
-async function startMic(){
-  micCtx = new AudioContext({ sampleRate: 16000 }); // browser resamples mic to 16k
+function pcm16b64(f32){
+  const i16 = new Int16Array(f32.length);
+  for (let i=0;i<f32.length;i++){ const s = Math.max(-1, Math.min(1, f32[i])); i16[i] = s<0 ? s*0x8000 : s*0x7FFF; }
+  return b64(i16.buffer);
+}
+
+// One mic feeds providers at different rates (Qwen 16k, OpenAI 24k). Linear
+// resample; identity fast-path means single-provider capture is untouched.
+function resample(f32, from, to){
+  if (from === to) return f32;
+  const ratio = from / to, n = Math.round(f32.length / ratio);
+  const out = new Float32Array(n);
+  for (let i=0;i<n;i++){ const x = i*ratio, i0 = x|0, frac = x-i0; out[i] = (f32[i0]||0)*(1-frac) + (f32[i0+1]||0)*frac; }
+  return out;
+}
+// ponytail: linear resample, no anti-alias lowpass. If Qwen ASR quality drops
+// on the 48k->16k path, add a one-pole lowpass before decimation.
+console.assert(resample(new Float32Array([1,2,3,4]), 24000, 24000).length === 4, "identity keeps length");
+console.assert(resample(new Float32Array([0,1,2,3]), 48000, 24000).length === 2, "48->24 halves length");
+console.assert(resample(new Float32Array([9,1,2,3]), 48000, 24000)[0] === 9, "first sample preserved");
+
+const RATE = { qwen: 16000, openai: 24000, gemini: 16000 };
+
+// Backend WS: ?backend=host:port overrides, else same-origin (local dev).
+function wsUrl(provider){
+  const backend = new URLSearchParams(location.search).get("backend");
+  const base = backend
+    ? `${backend.startsWith("http") ? backend.replace(/^http/, "ws") : (location.protocol === "https:" ? "wss" : "ws") + "://" + backend}/ws`
+    : `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`;
+  return `${base}?provider=${encodeURIComponent(provider)}`;
+}
+
+// --- Session: one provider connection + its rendering into `mount` --------
+// ponytail: one session today; side-by-side = two sessions into two mounts.
+function createSession({ provider, mount, onDown }){
+  let ws = null, cur = null, curSpeaker = null, nextTime = 0, playCtx = null;
+  const speakerColors = new Map();
+
+  function colorFor(speaker){
+    const key = speaker == null ? "Speaker" : speaker;
+    if (!speakerColors.has(key)) speakerColors.set(key, PALETTE[speakerColors.size % PALETTE.length]);
+    return speakerColors.get(key);
+  }
+  // qwen: speaker_id (from speech_started) starts a new turn/card.
+  // openai: no speaker msgs — a single running card (speaker=null) collects deltas.
+  // ponytail: single running card until OpenAI's boundary event is verified.
+  function newCard(speaker){
+    const el = document.createElement("div");
+    el.className = "card";
+    const label = speaker == null ? "Speaker" : "Speaker " + speaker;
+    el.innerHTML = `<span class="badge" style="background:${colorFor(speaker)}">${label}</span>`
+                 + `<div class="src"></div><div class="tr"></div>`;
+    mount.appendChild(el);
+    hintEl.style.display = "none";
+    cur = { speaker, srcEl: el.querySelector(".src"), trEl: el.querySelector(".tr") };
+    el.scrollIntoView({ behavior:"smooth", block:"end" });
+    return cur;
+  }
+  const ensure = () => cur || newCard(curSpeaker);
+
+  function handle(msg){
+    if (msg.kind === "speaker"){
+      curSpeaker = msg.speaker; newCard(curSpeaker);
+    } else if (msg.kind === "source"){
+      const c = ensure();
+      if (msg.final) c.srcEl.textContent = msg.text;   // completed = full transcript
+      else c.srcEl.textContent += msg.text;
+    } else if (msg.kind === "translation"){
+      ensure().trEl.textContent += msg.text;
+    } else if (msg.kind === "audio"){
+      if (!$("mute").checked) playChunk(msg.b64);
+    } else if (msg.kind === "status"){
+      if (msg.type === "response.done") cur = null;
+      else if (msg.type === "error") setStatus("server: " + JSON.stringify(msg.raw), true);
+    }
+  }
+
+  // Playback: 24kHz PCM16, sequential. OpenAI + Qwen both output 24kHz.
+  function playChunk(b64s){
+    const i16 = new Int16Array(bytesFromB64(b64s).buffer);
+    const buf = playCtx.createBuffer(1, i16.length, 24000);
+    const ch = buf.getChannelData(0);
+    for (let i=0;i<i16.length;i++) ch[i] = i16[i] / 32768;
+    const node = playCtx.createBufferSource();
+    node.buffer = buf; node.connect(playCtx.destination);
+    const t = Math.max(playCtx.currentTime, nextTime);
+    node.start(t); nextTime = t + buf.duration;
+  }
+
+  return {
+    provider,
+    rate: RATE[provider] || 24000,
+    start(cfg){
+      cur = null; curSpeaker = null; nextTime = 0;
+      playCtx = new AudioContext({ sampleRate: 24000 });
+      ws = new WebSocket(wsUrl(provider));
+      ws.onopen = () => ws.send(JSON.stringify({ type:"config", ...cfg }));
+      ws.onmessage = e => handle(JSON.parse(e.data));
+      ws.onerror = () => setStatus(provider + ": websocket error", true);
+      // Unexpected close tears down only THIS session (onDown), not its sibling.
+      ws.onclose = () => { if (running) onDown(); };
+    },
+    stop(){
+      const open = ws && ws.readyState === 1;
+      // Provider-blind "done" signal; the server maps it to the correct upstream
+      // close (session.finish for Qwen, session.close for OpenAI) and drains.
+      try { if (open) ws.send(JSON.stringify({ type:"session.finish" })); } catch {}
+      if (open){
+        ws.onerror = null;
+        // §2.6 drain: keep socket + playback alive so trailing translated audio
+        // arrives; the server closes the socket after draining, firing this to
+        // release the audio context.
+        // ponytail: drain plays out after Stop; a restart overlaps briefly, the
+        // old session self-terminates within the server's 5s drain timeout.
+        ws.onclose = () => { try { playCtx && playCtx.close(); } catch {} ws = playCtx = null; };
+      } else {  // already closed (unexpected drop / restart) — clean up now
+        if (ws) ws.onclose = ws.onerror = null;
+        try { ws && ws.close(); } catch {}
+        try { playCtx && playCtx.close(); } catch {}
+        ws = playCtx = null;
+      }
+      cur = null;
+    },
+    feed(f32, captureRate){
+      if (!ws || ws.readyState !== 1) return;
+      const audio = pcm16b64(resample(f32, captureRate, this.rate));
+      ws.send(JSON.stringify({ type:"input_audio_buffer.append", audio }));
+    },
+  };
+}
+
+// --- mic capture -> feeds every active session (one mic, N sessions) ------
+let micCtx, micStream, proc, sessions = [], running = false;
+async function startMic(captureRate){
+  micCtx = new AudioContext({ sampleRate: captureRate }); // 48k for compare mode; provider-native otherwise
   micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
   const src = micCtx.createMediaStreamSource(micStream);
   proc = micCtx.createScriptProcessor(4096, 1, 1);  // ponytail: deprecated but universal; AudioWorklet only if it matters
   proc.onaudioprocess = e => {
-    if (!ws || ws.readyState !== 1) return;
     const f32 = e.inputBuffer.getChannelData(0);
-    const i16 = new Int16Array(f32.length);
-    for (let i=0;i<f32.length;i++){ const s = Math.max(-1, Math.min(1, f32[i])); i16[i] = s<0 ? s*0x8000 : s*0x7FFF; }
-    ws.send(JSON.stringify({ type:"input_audio_buffer.append", audio: b64(i16.buffer) }));
+    for (const s of sessions) s.feed(f32, micCtx.sampleRate);  // each resamples to its own rate
   };
   src.connect(proc); proc.connect(micCtx.destination);
 }
+function stopMic(){
+  proc && (proc.onaudioprocess = null, proc.disconnect());
+  micStream && micStream.getTracks().forEach(t => t.stop());
+  try { micCtx && micCtx.close(); } catch {}
+  micCtx = proc = micStream = null;
+}
 
 // --- lifecycle ------------------------------------------------------------
-async function start(){
-  running = true; cur = null; curSpeaker = null; nextTime = 0;
+function start(){
+  running = true;
   $("toggle").textContent = "Stop"; $("toggle").classList.add("on");
   setStatus("connecting…");
-  playCtx = new AudioContext({ sampleRate: 24000 });
-  ws = new WebSocket(`ws://${location.host}/ws`);
-  ws.onopen = () => {
-    ws.send(JSON.stringify({ type:"config", source_language: $("src").value, target_language: $("tgt").value }));
-    startMic().then(() => setStatus("listening — speak now")).catch(e => { setStatus("mic error: "+e.message, true); stop(); });
-  };
-  ws.onmessage = e => handle(JSON.parse(e.data));
-  ws.onerror = () => setStatus("websocket error", true);
-  ws.onclose = () => { if (running) { setStatus("disconnected", true); stop(); } };
+  logEl.innerHTML = "";
+  const cfg = { source_language: $("src").value, target_language: $("tgt").value };
+  const providers = $("provider").value === "both" ? ["qwen", "openai"] : [$("provider").value];
+
+  if (providers.length > 1){
+    $("mute").checked = true;  // ponytail: auto-mute in compare mode; per-column solo if a user asks.
+    const cols = document.createElement("div"); cols.className = "cols";
+    sessions = providers.map(p => {
+      const col = document.createElement("div"); col.className = "col";
+      col.innerHTML = `<div class="colhead">${providerLabel(p)}</div>`;
+      cols.appendChild(col);
+      return createSession({ provider: p, mount: col, onDown: () => sessionDown(p) });
+    });
+    logEl.appendChild(cols);
+  } else {
+    const p = providers[0];
+    sessions = [createSession({ provider: p, mount: logEl, onDown: () => sessionDown(p) })];
+  }
+
+  sessions.forEach(s => s.start(cfg));
+  // Compare mode captures once at 48k and each session resamples; single = native.
+  const captureRate = providers.length > 1 ? 48000 : sessions[0].rate;
+  startMic(captureRate).then(() => setStatus("listening — speak now"))
+                       .catch(e => { setStatus("mic error: "+e.message, true); stop(); });
 }
 function stop(){
   running = false;
   $("toggle").textContent = "Start"; $("toggle").classList.remove("on");
-  try { ws && ws.readyState === 1 && ws.send(JSON.stringify({ type:"session.finish" })); } catch {}
-  if (ws) ws.onclose = ws.onerror = null;  // stale close must not re-stop a restarted session
-  try { ws && ws.close(); } catch {}
-  proc && (proc.onaudioprocess = null, proc.disconnect());
-  micStream && micStream.getTracks().forEach(t => t.stop());
-  micCtx && micCtx.close(); playCtx && playCtx.close();
-  ws = micCtx = playCtx = proc = micStream = null; cur = null;
+  sessions.forEach(s => s.stop());
+  stopMic();
+  sessions = [];
   if (statusEl.className !== "err") setStatus("idle");
 }
+// One provider's connection dropped: tear down just that column. Only when the
+// last session is gone do we fully stop (which also stops the shared mic).
+function sessionDown(provider){
+  if (!running) return;
+  const s = sessions.find(x => x.provider === provider);
+  if (!s) return;
+  s.stop();
+  sessions = sessions.filter(x => x !== s);
+  setStatus(providerLabel(provider) + " disconnected", true);
+  if (sessions.length === 0) stop();
+}
+// Display label straight from the dropdown — no second source of truth.
+function providerLabel(p){ return [...$("provider").options].find(o => o.value === p)?.text || p; }
 $("toggle").onclick = () => running ? stop() : start();
-// Language changes must reach the model, which only gets config at connect time.
-// Restart the session so start() re-sends the current source/target.
-function applyLangChange(){ if (running){ stop(); start(); } }
+
+// Provider/language changes only reach the model at connect time — restart.
+function applyChange(){ if (running){ stop(); start(); } }
+
+// OpenAI auto-detects source: gate the "From" selector + swap.
+function updateProviderUI(){
+  const autoSrc = ["openai", "gemini"].includes($("provider").value);  // both auto-detect source
+  $("src").disabled = autoSrc;
+  $("swap").disabled = autoSrc;
+  $("srchint").style.display = autoSrc ? "" : "none";
+}
+$("provider").onchange = () => { updateProviderUI(); applyChange(); };
 $("swap").onclick = () => {
   const s = $("src").value;
   $("src").value = $("tgt").value;
   $("tgt").value = s;
-  applyLangChange();
+  applyChange();
 };
-$("src").onchange = applyLangChange;
-$("tgt").onchange = applyLangChange;
+$("src").onchange = applyChange;
+$("tgt").onchange = applyChange;
+updateProviderUI();
 </script>
 </body>
 </html>
