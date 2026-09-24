@@ -253,10 +253,13 @@ function start(){
   setStatus("connecting…");
   logEl.innerHTML = "";
   const cfg = { source_language: $("src").value, target_language: $("tgt").value };
-  const providers = $("provider").value === "both" ? ["qwen", "openai"] : [$("provider").value];
+  const providers = $("provider").value === "both" ? ["qwen", "gemini"] : [$("provider").value];
+  // Compare mode = transcription only: audio off and locked. Single mode: audio on, user can mute.
+  const compare = providers.length > 1;
+  $("mute").checked = compare;
+  $("mute").disabled = compare;
 
-  if (providers.length > 1){
-    $("mute").checked = true;  // ponytail: auto-mute in compare mode; per-column solo if a user asks.
+  if (compare){
     const cols = document.createElement("div"); cols.className = "cols";
     sessions = providers.map(p => {
       const col = document.createElement("div"); col.className = "col";

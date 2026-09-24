@@ -78,16 +78,22 @@ _gemini_client = None
 
 
 def gemini_client():
-    """Vertex/Agent-Platform client via ADC. Lazy so --self-check + the other
-    providers need no Google creds or SDK import at module load."""
+    """Gemini client. Prefers a Developer API key (GEMINI_API_KEY — the Live
+    Translate quickstart path); falls back to Vertex/Agent-Platform via ADC
+    (enterprise=True + project/location) when no key is set. Lazy so --self-check
+    + the other providers need no Google creds or SDK import at module load."""
     global _gemini_client
     if _gemini_client is None:
         from google import genai
-        _gemini_client = genai.Client(
-            enterprise=True,
-            project=os.environ.get("GOOGLE_CLOUD_PROJECT"),
-            location=os.environ.get("GOOGLE_CLOUD_REGION", "global"),
-        )
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if api_key:
+            _gemini_client = genai.Client(api_key=api_key)
+        else:
+            _gemini_client = genai.Client(
+                enterprise=True,
+                project=os.environ.get("GOOGLE_CLOUD_PROJECT"),
+                location=os.environ.get("GOOGLE_CLOUD_REGION", "global"),
+            )
     return _gemini_client
 
 
@@ -206,7 +212,10 @@ def _gemini_config(target_language: str):
         output_audio_transcription=types.AudioTranscriptionConfig(),
         translation_config=types.TranslationConfig(
             target_language_code=gemini_lang(target_language),
-            echo_target_language=True,  # rebroadcast input already in the target language
+            # False: don't re-emit input already in the target language. =True created
+            # an acoustic feedback loop — translated TTS was picked up by the mic,
+            # re-fed, and rebroadcast verbatim, repeating one utterance forever.
+            echo_target_language=False,
         ),
     )
 
@@ -237,6 +246,11 @@ async def gemini_bridge(browser: WebSocket, target: str):
     language is auto-detected; 16 kHz PCM in, 24 kHz PCM out.
     ponytail: no session rotation — Live sessions have a ~150s practical cap; on drop
     the frontend shows "disconnected". Rotate with ~0.5s overlap if long sessions matter."""
+    if not (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_CLOUD_PROJECT")):
+        await browser.send_json({"kind": "status", "type": "error",
+                                 "raw": "gemini not configured: set GEMINI_API_KEY (or GOOGLE_CLOUD_PROJECT for Vertex/ADC)"})
+        await browser.close()
+        return
     from google.genai import types
     print(f"[bridge] opening gemini (target={target} -> {gemini_lang(target)})")
     try:
@@ -282,7 +296,11 @@ async def gemini_bridge(browser: WebSocket, target: str):
                     for out in normalize_gemini(d):
                         await browser.send_json(out)
 
-            await _pump_bridge(browser_to_gemini, gemini_to_browser, drain_timeout=2)
+            # Spike finding: translated audio arrives ~1-3s behind input and the
+            # model never sends turn_complete, so recv() never ends on its own —
+            # _pump_bridge always waits the full drain then cancels. 3s captures
+            # the final utterance's audio tail without a long idle-silence wait.
+            await _pump_bridge(browser_to_gemini, gemini_to_browser, drain_timeout=3)
     except Exception as e:  # noqa: BLE001 — surface connect/auth failure to the browser
         print(f"[bridge] gemini FAILED: {e}")
         try:
