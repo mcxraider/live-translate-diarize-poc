@@ -1,0 +1,25 @@
+{
+  "qwen": {
+    "model": "qwen3.8-livetranslate-flash-realtime",
+    "url": "wss://maas.qwencloudapi.com/api-ws/v1/realtime?model={model}",
+    "voice": "Tina",
+    "transcription_model": "qwen3-asr-flash-realtime",
+    "input_sample_rate": 16000,
+    "output_sample_rate": 24000,
+    "drain_seconds": 0
+  },
+  "openai": {
+    "model": "gpt-realtime-translate",
+    "url": "wss://api.openai.com/v1/realtime/translations?model={model}",
+    "input_sample_rate": 24000,
+    "output_sample_rate": 24000,
+    "drain_seconds": 5
+  },
+  "gemini": {
+    "model": "gemini-3.5-live-translate-preview",
+    "input_sample_rate": 16000,
+    "output_sample_rate": 24000,
+    "drain_seconds": 3,
+    "echo_target_language": false
+  }
+}

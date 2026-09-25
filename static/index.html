@@ -66,10 +66,11 @@
   <div class="hint" id="hint">Pick languages, click Start, and speak. Utterances group by speaker.</div>
 </main>
 
-<script>
+<script type="module">
 const $ = id => document.getElementById(id);
 const statusEl = $("status"), logEl = $("log"), hintEl = $("hint");
 const PALETTE = ["#2b2f36","#565c66","#7a828e","#3f4650","#6b7280","#4b5563"];
+const MODEL_CONFIG = await fetch("/models.json").then(r => r.json());
 
 // Singapore + regional set. (Tamil not offered by LiveTranslate.)
 const LANGS = {
@@ -116,8 +117,6 @@ console.assert(resample(new Float32Array([1,2,3,4]), 24000, 24000).length === 4,
 console.assert(resample(new Float32Array([0,1,2,3]), 48000, 24000).length === 2, "48->24 halves length");
 console.assert(resample(new Float32Array([9,1,2,3]), 48000, 24000)[0] === 9, "first sample preserved");
 
-const RATE = { qwen: 16000, openai: 24000, gemini: 16000 };
-
 // Backend WS: ?backend=host:port overrides, else same-origin (local dev).
 function wsUrl(provider){
   const backend = new URLSearchParams(location.search).get("backend");
@@ -131,6 +130,7 @@ function wsUrl(provider){
 // ponytail: one session today; side-by-side = two sessions into two mounts.
 function createSession({ provider, mount, onDown }){
   let ws = null, cur = null, curSpeaker = null, nextTime = 0, playCtx = null;
+  const model = MODEL_CONFIG[provider];
   const speakerColors = new Map();
 
   function colorFor(speaker){
@@ -175,7 +175,7 @@ function createSession({ provider, mount, onDown }){
   // Playback: 24kHz PCM16, sequential. OpenAI + Qwen both output 24kHz.
   function playChunk(b64s){
     const i16 = new Int16Array(bytesFromB64(b64s).buffer);
-    const buf = playCtx.createBuffer(1, i16.length, 24000);
+    const buf = playCtx.createBuffer(1, i16.length, model.output_sample_rate);
     const ch = buf.getChannelData(0);
     for (let i=0;i<i16.length;i++) ch[i] = i16[i] / 32768;
     const node = playCtx.createBufferSource();
@@ -186,10 +186,10 @@ function createSession({ provider, mount, onDown }){
 
   return {
     provider,
-    rate: RATE[provider] || 24000,
+    rate: model.input_sample_rate,
     start(cfg){
       cur = null; curSpeaker = null; nextTime = 0;
-      playCtx = new AudioContext({ sampleRate: 24000 });
+      playCtx = new AudioContext({ sampleRate: model.output_sample_rate });
       ws = new WebSocket(wsUrl(provider));
       ws.onopen = () => ws.send(JSON.stringify({ type:"config", ...cfg }));
       ws.onmessage = e => handle(JSON.parse(e.data));

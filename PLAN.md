@@ -1,187 +1,248 @@
-# Plan: add GPT realtime-translate alongside Qwen
+# Plan: name and orchestrate the evaluation pipeline
 
-Add OpenAI's `gpt-realtime-translate` as a second provider behind the existing
-browser↔server WebSocket bridge, selectable from the UI. Build the seams for a
-future side-by-side (both providers at once) without building the split screen.
+## Goal
 
-Decisions locked in the grilling session (Q1–Q8) drive everything below.
+Give each existing evaluation stage a precise name and a standalone command,
+then add one command that runs the same stages end to end. Keep the recovery
+behavior already implemented in `evals/eval.py`; this work is primarily about
+clear stage interfaces and orchestration, with a small number of remaining
+validation fixes.
 
----
+## Current baseline to preserve
 
-## 0. Facts this plan relies on
+The current script already has the important reliability mechanics. Do not
+replace or weaken them during the refactor:
 
-- **Qwen (current):** browser sends 16kHz PCM16 base64 → `/ws` → DashScope.
-  Diarisation via `speaker_id` on `input_audio_buffer.speech_started`. Turn end
-  = `response.done`. Finish = `session.finish`. Output audio 24kHz.
-- **OpenAI translate:** dedicated endpoint
-  `wss://api.openai.com/v1/realtime/translations?model=gpt-realtime-translate`,
-  header `Authorization: Bearer $OPENAI_API_KEY`. Input/output **24kHz** PCM16.
-  Config via `session.update` sets **only** `audio.output.language` (ISO 639-1
-  two-letter code) — source is auto-detected, no source language. **No
-  diarisation.** Close protocol: send `session.close`, keep reading until
-  `session.closed`, then close socket (early close drops draining audio).
-- **OpenAI event names we forward** (from docs):
-  `session.output_transcript.delta` (translated text),
-  `session.input_transcript.delta` (source text),
-  `session.output_audio.delta` (audio), `session.closed`, `error`.
-- **UNVERIFIED — discover live:** OpenAI has no documented per-utterance
-  *boundary* event and no `*.completed` events for translation sessions. The
-  existing code discovered Qwen's schema live via the `[ds->]` raw logger; do
-  the same here (§2.5). Until confirmed, OpenAI renders as **one continuous
-  card** (§3.4), which is also the honest "no diarisation" comparison point.
-- OpenAI's supported target-language list is **not published**; unsupported
-  codes surface as `session.error`. Filipino is `fil` (Qwen) vs `tl` (ISO).
+- Manifest, translation, and judgment CSVs are written atomically with flush,
+  `fsync`, and rename.
+- TTS stops on the first failed file, cleans temporary files, and leaves prior
+  valid WAVs in place so a retry skips them.
+- Translation and judging checkpoint every completed unit.
+- Translation and judging stop scheduling new work after the first remote
+  failure while allowing in-flight work to finish and be checkpointed.
+- Resume restores only mutable result/error columns after validating columns,
+  row order, `pair_id`, and immutable source values.
+- Completed translation cells and judgment rows are skipped on resume; failed
+  or empty work is retried.
+- Printed resume commands retain `--language` and `--limit`.
+- Judging rejects incomplete inference before making judge calls.
+- `--output` cannot overwrite the judge input itself.
+- `--self-check` covers WAV validation, deterministic audio mapping, judgment
+  parsing, atomic CSV I/O, and checkpoint restoration.
 
----
+## Stage names and commands
 
-## 1. `.env.example`
+Replace the generic mode flags with verb-based subcommands:
 
-Add:
+| Stage | Command | Reads | Produces |
+|---|---|---|---|
+| 1. Build evaluation manifest | `build-manifest` | golden-pairs CSV | `evals/eval_input.csv` |
+| 2. Synthesize evaluation audio | `synthesize-audio` | manifest text and audio paths | validated WAVs in `audio_files/` |
+| 3. Run translation models | `run-translations` | manifest and WAVs | `evals/results_<run-id>.csv` |
+| 4. Judge translation results | `judge-results` | translation results CSV | `evals/judged_results_<run-id>.csv` |
+| Orchestrate all four | `run-pipeline` | golden-pairs CSV | all artifacts above |
+
+`self-check` remains a diagnostic command, not a pipeline stage.
+
+Target CLI:
+
+```bash
+uv run evals/eval.py build-manifest
+uv run evals/eval.py synthesize-audio --language ms --limit 2
+uv run evals/eval.py run-translations --language ms --limit 2
+uv run evals/eval.py judge-results evals/results_20260925_120000.csv
+
+uv run evals/eval.py run-pipeline --language ms --limit 2
+uv run evals/eval.py self-check
 ```
-# OpenAI realtime translate (provider=openai)
-OPENAI_API_KEY=your_openai_key_here
-# Optional override, default below:
-# OPENAI_TRANSLATE_MODEL=gpt-realtime-translate
-```
 
-## 2. `server.py`
+Use `argparse` subparsers so each command shows only relevant options. TTS
+options belong only to `synthesize-audio` and `run-pipeline`; websocket pacing
+options belong only to `run-translations` and `run-pipeline`; judge input and
+output options belong only to `judge-results`.
 
-### 2.1 Provider constants
-- `OPENAI_MODEL = os.environ.get("OPENAI_TRANSLATE_MODEL", "gpt-realtime-translate")`
-- `openai_url()` mirroring `dashscope_url()`:
-  `wss://api.openai.com/v1/realtime/translations?model={OPENAI_MODEL}`
-  (override via `OPENAI_WS_URL`).
+## Stage interface
 
-### 2.2 Language code override
+Rename the existing stage functions and make their artifact handoffs explicit:
+
 ```python
-# ISO 639-1 mostly matches our LANGS codes; only Filipino differs.
-# ponytail: single hardcoded override; make a per-provider map if more appear.
-def openai_lang(code: str) -> str:
-    return {"fil": "tl"}.get(code, code)
+build_manifest(...) -> Path
+synthesize_audio(manifest_path, ...) -> StageSummary
+run_translations(manifest_path, output_path, ...) -> Path
+judge_results(results_path, output_path, ...) -> Path
+run_pipeline(...) -> PipelineArtifacts
 ```
 
-### 2.3 Per-provider config builders
-- Keep `_session_update(...)` as the **Qwen** builder (unchanged).
-- Add `_openai_session_update(target_language)`:
-```python
-{"type": "session.update",
- "session": {"audio": {"output": {"language": openai_lang(target_language)}}}}
+The important seam is the returned artifact path. `run-pipeline` must pass the
+exact path returned by one stage into the next; it must never glob for or guess
+the newest results file.
+
+Keep this lightweight. One small `StageSummary` record for generated/skipped
+counts and one `PipelineArtifacts` record for final paths are sufficient. Do
+not introduce provider classes or a general workflow framework; Qwen, Gemini,
+OpenAI TTS, and Router logic can remain where they are.
+
+Stage functions should not call `sys.exit()`, because that makes them awkward
+to compose and test. Raise a small `EvalError` for expected input/configuration
+failures and `StageFailed` when remote work fails after a checkpoint is saved.
+Only the CLI adapter converts those errors into messages and exit codes.
+
+## Full-pipeline behavior
+
+`run-pipeline` is thin orchestration over the same four public stage functions:
+
+```text
+golden CSV
+    -> build-manifest
+    -> synthesize-audio
+    -> run-translations
+    -> judge-results
 ```
-  (No source, no voice, no turn_detection.)
 
-### 2.4 Per-provider normalize
-- Keep `normalize_event` (Qwen) unchanged.
-- Add `normalize_openai(event)` → same flat `{kind:...}` contract:
-  - `session.output_transcript.delta` → `{"kind":"translation","text":delta}`
-  - `session.input_transcript.delta`  → `{"kind":"source","text":delta,"final":False}`
-  - `session.output_audio.delta`      → `{"kind":"audio","b64":delta}`
-  - `error` / `session.closed`        → `{"kind":"status","type":et,"raw":event}`
-  - else `None`
-  - (No `speaker` kind — OpenAI has no diarisation.)
+At startup, allocate one `run-id` using the existing timestamp format. Use it
+for both result artifacts:
 
-### 2.5 `/ws` dispatch
-Read provider from query: `browser: WebSocket` handler reads
-`browser.query_params.get("provider", "qwen")`. Then branch a small config:
-```python
-if provider == "openai":
-    url, key = openai_url(), os.environ.get("OPENAI_API_KEY")
-    session_update = _openai_session_update(target)          # no source
-    normalize = normalize_openai
-    keyname = "OPENAI_API_KEY"
-else:
-    url, key = dashscope_url(), os.environ.get("DASHSCOPE_API_KEY")
-    session_update = _session_update(target, source)
-    normalize = normalize_event
-    keyname = "DASHSCOPE_API_KEY"
+```text
+evals/results_<run-id>.csv
+evals/judged_results_<run-id>.csv
 ```
-Everything after (accept, missing-key error using `keyname`, connect, send
-`session_update`, the two pump tasks) stays shared. `ds_to_browser` keeps the
-raw `[ds->]` logger — this is how we discover OpenAI's real event schema live.
 
-### 2.6 Close/drain (Q7)
-Replace the current `finally` block with provider-aware drain:
-- **qwen:** unchanged — best-effort `session.finish`, cancel tasks, close.
-- **openai:** send `{"type":"session.close"}`, then **keep reading upstream and
-  forwarding to the browser until a `session.closed` event arrives** (with a
-  timeout guard, e.g. 5s), then close. Do not cancel `ds_to_browser` before the
-  drain completes.
-  - Implementation: when `browser_to_ds` ends (browser gone/finished), trigger
-    the drain in `ds_to_browser` rather than cancelling it immediately.
-  - `ponytail: 5s drain timeout; raise only if real output gets truncated.`
+Print the run id and planned artifact paths before any network call. Apply
+`--language` and `--limit` consistently to synthesis, translation, and judging.
+The manifest can continue to contain the full golden dataset; the selected rows
+in later stages must remain identical.
 
-### 2.7 Self-check
-Extend `_self_check()` with `normalize_openai` assertions for each mapped event
-+ one `None` case. Keep it runnable via `--self-check` (no key needed).
+If any stage fails, do not start the next stage. The raised error identifies
+the failed stage and, when applicable, the checkpoint and exact resume command.
 
-## 3. `static/index.html`
+Support deterministic pipeline resume:
 
-### 3.1 Session object refactor (Q2 seam)
-Today `ws / cur / curSpeaker / nextTime / speakerColors / playCtx` are module
-globals. Wrap per-connection state in a `Session`:
-```js
-function createSession({ provider, mount }) {
-  // owns: ws, cur, curSpeaker, nextTime, playCtx, speakerColors
-  // methods: start(cfg), stop(), handle(msg), and card rendering into `mount`
-}
+```bash
+uv run evals/eval.py run-pipeline --run-id 20260925_120000 --resume \
+  --language ms --limit 2
 ```
-- Mic capture (`getUserMedia` + ScriptProcessor) stays **outside** the session
-  (one mic) and pushes PCM into whichever session(s) are active. For now a
-  single active session; the fan-out to N sessions is the future seam.
-- `#log` becomes the mount for the single current session.
-- `ponytail: one session today; side-by-side = two sessions into two mounts.`
 
-### 3.2 Provider dropdown
-Header gets `<label>Provider <select id="provider"><option>Qwen</option>
-<option>OpenAI</option></select></label>`. Changing it restarts like language
-changes do (`applyLangChange` → generalize to `applyChange`).
+On resume:
 
-### 3.3 "From" selector gating (Q3)
-When provider = OpenAI: `$("src").disabled = true`, greyed, and show an
-"auto-detected" hint near it. Re-enable for Qwen. The swap button is disabled
-too when source is meaningless.
+- rebuild the deterministic manifest;
+- let audio synthesis skip valid existing WAVs;
+- resume the named translation checkpoint if it exists, otherwise start it;
+- run or resume the derived judged-results checkpoint only after translation
+  is complete.
 
-### 3.4 Card rendering per provider (Q4)
-- **qwen:** unchanged — `speaker` msg starts a new card, label `Speaker N`,
-  color per speaker.
-- **openai:** no `speaker` msgs arrive. Start with **one running card** labeled
-  plain `Speaker` (no number, neutral color); source/translation deltas append
-  to it. Reset the card on `response`/utterance-boundary **once we confirm the
-  real boundary event from the live log** (§2.5) — until then, one card.
-  - `ponytail: single running card until OpenAI's boundary event is verified.`
+Never infer a run id from “the latest” file.
 
-### 3.5 WS URL + config send
-- `wsUrl` gains `?provider=${provider}` (preserve existing `?backend=` override;
-  append provider to whichever URL is built).
-- `config` message still sends `source_language` + `target_language`; backend
-  ignores source for OpenAI. No frontend change to the config payload.
+## Remaining error-handling work
 
-### 3.6 Capture sample rate (Q6)
-`startMic()` sets `AudioContext({ sampleRate: provider === "openai" ? 24000 : 16000 })`.
-- `ponytail: per-provider capture rate; side-by-side needs one-rate capture +
-  a JS resampler for the non-native provider.`
+### Preflight validation
 
-### 3.7 Playback
-No change — OpenAI output is 24kHz PCM16, same as the current `playCtx`
-(`sampleRate: 24000`) and `playChunk`. Reused as-is.
+Finish validation before making paid or remote calls:
 
-## 4. Explicitly deferred (seams left, code not written)
-- Two-column simultaneous Qwen+OpenAI view.
-- JS resampler so one mic feeds both providers at once.
-- Generalized per-provider language-code map (only `fil→tl` today).
-- WebRTC transport for OpenAI (staying on server WebSocket relay).
+- All commands: reject `--limit <= 0`.
+- Audio synthesis: validate `OPENAI_API_KEY`, TTS speed, `ffmpeg`, selected rows,
+  and output directory before creating the client.
+- Translation: reject `--workers <= 0`, negative `--sleep`, negative `--pace`,
+  and non-positive provider timeouts; validate manifest columns and unique
+  `pair_id` values; validate every selected WAV before starting either provider;
+  validate Qwen and Gemini credentials/configuration up front.
+- Judging: keep the current schema, duplicate-id, completeness, and input/output
+  checks; validate Router configuration before creating the output checkpoint.
+- Manifest: add an explicit duplicate-`pair_id` check and reject empty required
+  English/translation text rather than emitting blank audio paths.
 
-## 5. Verification
-1. `uv run server.py --self-check` — passes (Qwen + OpenAI normalize).
-2. Manual: `provider=qwen` still works end-to-end (no regression).
-3. Manual: `provider=openai` with a real key — source auto-detected, translated
-   text + audio play, `From` greyed, one card. Watch server `[ds->]` log to
-   confirm OpenAI's real event names and any utterance-boundary event; fold
-   findings back into §2.4 / §3.4.
-4. Try an unsupported OpenAI language (e.g. `ms`) — confirm it surfaces as a
-   status-line error, not a silent hang.
+This prevents a malformed late row or missing credential from consuming earlier
+paid calls before the run fails.
 
-## Open risk
-OpenAI's per-utterance boundary + `*.completed` events are unconfirmed. Plan
-ships the honest single-card fallback and discovers the real schema from the
-live log, exactly as the Qwen path was built. No architectural change expected
-either way — only §3.4 card-reset logic.
+### Output safety
+
+- A fresh `run-translations --output PATH` must reject an existing path unless
+  `--resume` or an explicit `--overwrite` is supplied.
+- `judge-results` must likewise avoid silently replacing an existing judgment
+  checkpoint unless resuming or explicitly overwriting it.
+- Preserve the current atomic temporary-file cleanup behavior.
+
+### Exit behavior
+
+- Exit `0` when requested work completes or the checkpoint is already complete.
+- Exit `2` for invalid CLI usage, configuration, input, or checkpoint mismatch.
+- Exit `1` for a remote stage failure after durable work may have been saved.
+- On `KeyboardInterrupt`, stop scheduling work, allow safe checkpointing of any
+  completed result already in hand, print the checkpoint path, and exit `130`.
+- Expected errors get concise `ERROR [stage]: ...` messages without tracebacks.
+  Unexpected programming errors retain their tracebacks.
+
+Keep per-cell and per-row error columns as the durable error record. Continue
+truncating unbounded judge errors, and do not print credentials, authorization
+headers, or raw provider events containing transcript/audio data.
+
+## Implementation order
+
+1. Add `EvalError`/`StageFailed` and convert current stage-level `sys.exit()`
+   calls to raised errors. Preserve the existing worker-level error capture.
+2. Rename `prepare`, `synthesize`, `run`, and `judge` to `build_manifest`,
+   `synthesize_audio`, `run_translations`, and `judge_results`. Return artifact
+   paths/summaries without changing provider request logic.
+3. Add the remaining preflight and output-collision checks listed above.
+4. Replace the mutually exclusive flags with stage-specific subparsers and
+   update resume-command formatting to use the new command names.
+5. Add `run_pipeline` with one run id and explicit path passing. Reuse the stage
+   functions; do not duplicate their implementations.
+6. Update the module docstring and `README.md` to match the final commands,
+   artifact names, credentials, and resume behavior.
+
+## Verification
+
+Keep the current self-check assertions and extend them with focused, offline
+tests using temporary files and fake provider callables:
+
+1. CLI dispatch:
+   - every subcommand invokes the correct stage;
+   - options appear only on relevant commands;
+   - invalid numeric values fail before a stage starts.
+2. Manifest:
+   - shared English and unique target paths remain deterministic;
+   - duplicate ids, unsafe labels, inconsistent English, empty required text,
+     and missing columns fail cleanly.
+3. Synthesis:
+   - valid WAVs are skipped and invalid WAVs are regenerated;
+   - temporary files are removed after failure;
+   - a mocked TTS failure preserves earlier files and stops later calls.
+4. Translation:
+   - four cells are scheduled per selected row;
+   - malformed audio or missing credentials cause zero provider calls;
+   - a mocked failure stops new scheduling and leaves a resumable checkpoint;
+   - resume retries only failed or empty cells and retains filters.
+5. Judging:
+   - blind ordering and winner mapping remain stable;
+   - incomplete inference causes zero Router calls;
+   - malformed judge JSON is checkpointed as an error;
+   - resume retries only failed or empty rows and retains filters.
+6. Pipeline:
+   - fake stages run once in the required order;
+   - each stage receives the exact previous artifact path;
+   - one run id names both result files;
+   - a stage failure prevents every downstream stage;
+   - `--resume --run-id ...` uses the correct existing checkpoints.
+
+Local acceptance commands after implementation:
+
+```bash
+uv run evals/eval.py self-check
+uv run evals/eval.py build-manifest
+uv run evals/eval.py run-pipeline --language ms --limit 1
+```
+
+The final live smoke test succeeds only when it produces one judged row, prints
+all artifact paths, exits zero, and leaves no `.tmp` files behind.
+
+## Acceptance criteria
+
+- Each of the four accurately named stages runs independently.
+- `run-pipeline` runs the same four functions in order with one command.
+- Existing atomic checkpoint, fail-fast, and resume behavior is preserved.
+- Pipeline artifact handoff is explicit; no “latest file” lookup exists.
+- Invalid input/configuration causes no remote calls.
+- Partial remote failure returns non-zero with a valid checkpoint and exact
+  resume command.
+- Filters remain identical across a full run and its resume.
+- CLI help, module documentation, and README examples agree with behavior.

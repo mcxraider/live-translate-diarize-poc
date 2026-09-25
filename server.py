@@ -25,6 +25,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 STATIC_DIR = Path(__file__).parent / "static"
+MODEL_CONFIG = json.loads((Path(__file__).parent / "models.json").read_text())
 
 
 def _load_dotenv():
@@ -42,7 +43,7 @@ def _load_dotenv():
 
 _load_dotenv()
 # 3.8 is required for diarisation; the older qwen3-livetranslate has no speaker_id.
-MODEL = os.environ.get("DASHSCOPE_MODEL", "qwen3.8-livetranslate-flash-realtime")
+MODEL = os.environ.get("DASHSCOPE_MODEL", MODEL_CONFIG["qwen"]["model"])
 
 
 def dashscope_url() -> str:
@@ -50,18 +51,18 @@ def dashscope_url() -> str:
     Override the whole URL with DASHSCOPE_WS_URL if the docs change."""
     return os.environ.get(
         "DASHSCOPE_WS_URL",
-        f"wss://maas.qwencloudapi.com/api-ws/v1/realtime?model={MODEL}",
+        MODEL_CONFIG["qwen"]["url"].format(model=MODEL),
     )
 
 
-OPENAI_MODEL = os.environ.get("OPENAI_TRANSLATE_MODEL", "gpt-realtime-translate")
+OPENAI_MODEL = os.environ.get("OPENAI_TRANSLATE_MODEL", MODEL_CONFIG["openai"]["model"])
 
 
 def openai_url() -> str:
     """OpenAI realtime translations WS URL. Override with OPENAI_WS_URL."""
     return os.environ.get(
         "OPENAI_WS_URL",
-        f"wss://api.openai.com/v1/realtime/translations?model={OPENAI_MODEL}",
+        MODEL_CONFIG["openai"]["url"].format(model=OPENAI_MODEL),
     )
 
 
@@ -72,7 +73,7 @@ def openai_lang(code: str) -> str:
 
 
 # --- Gemini 3.5 Live Translate (Agent Platform / Vertex, google-genai SDK) ---
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-live-translate-preview")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", MODEL_CONFIG["gemini"]["model"])
 
 _gemini_client = None
 
@@ -171,12 +172,17 @@ async def index():
     return HTMLResponse("<h1>LiveTranslate POC backend up.</h1><p>No frontend yet — drop index.html into static/.</p>")
 
 
+@app.get("/models.json")
+async def model_config():
+    return FileResponse(Path(__file__).parent / "models.json")
+
+
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 def _session_update(target_language: str, source_language: str | None) -> dict:
-    transcription = {"model": "qwen3-asr-flash-realtime"}
+    transcription = {"model": MODEL_CONFIG["qwen"]["transcription_model"]}
     if source_language:
         transcription["language"] = source_language
     return {
@@ -184,7 +190,7 @@ def _session_update(target_language: str, source_language: str | None) -> dict:
         "type": "session.update",
         "session": {
             "output_modalities": ["text", "audio"],
-            "voice": os.environ.get("DASHSCOPE_VOICE", "Tina"),  # required even in text-only
+            "voice": os.environ.get("DASHSCOPE_VOICE", MODEL_CONFIG["qwen"]["voice"]),  # required even in text-only
             "input_audio_format": "pcm",
             "output_audio_format": "pcm",
             "input_audio_transcription": transcription,
@@ -215,7 +221,7 @@ def _gemini_config(target_language: str):
             # False: don't re-emit input already in the target language. =True created
             # an acoustic feedback loop — translated TTS was picked up by the mic,
             # re-fed, and rebroadcast verbatim, repeating one utterance forever.
-            echo_target_language=False,
+            echo_target_language=MODEL_CONFIG["gemini"]["echo_target_language"],
         ),
     )
 
@@ -266,7 +272,7 @@ async def gemini_bridge(browser: WebSocket, target: str):
                         if t == "input_audio_buffer.append":
                             pcm = base64.b64decode(msg["audio"])
                             await session.send_realtime_input(
-                                audio=types.Blob(data=pcm, mime_type="audio/pcm;rate=16000"))
+                                audio=types.Blob(data=pcm, mime_type=f"audio/pcm;rate={MODEL_CONFIG['gemini']['input_sample_rate']}"))
                         elif t in ("session.finish", "session.close"):
                             await session.send_realtime_input(audio_stream_end=True)
                             return  # let _pump_bridge drain trailing output
@@ -300,7 +306,8 @@ async def gemini_bridge(browser: WebSocket, target: str):
             # model never sends turn_complete, so recv() never ends on its own —
             # _pump_bridge always waits the full drain then cancels. 3s captures
             # the final utterance's audio tail without a long idle-silence wait.
-            await _pump_bridge(browser_to_gemini, gemini_to_browser, drain_timeout=3)
+            await _pump_bridge(browser_to_gemini, gemini_to_browser,
+                               drain_timeout=MODEL_CONFIG["gemini"]["drain_seconds"])
     except Exception as e:  # noqa: BLE001 — surface connect/auth failure to the browser
         print(f"[bridge] gemini FAILED: {e}")
         try:
@@ -338,14 +345,14 @@ async def ws_bridge(browser: WebSocket):
         normalize = normalize_openai
         keyname = "OPENAI_API_KEY"
         finish_frame = json.dumps({"type": "session.close"})
-        drain = 5
+        drain = MODEL_CONFIG["openai"]["drain_seconds"]
     else:
         url, api_key = dashscope_url(), os.environ.get("DASHSCOPE_API_KEY")
         session_update = _session_update(target, source)
         normalize = normalize_event
         keyname = "DASHSCOPE_API_KEY"
         finish_frame = json.dumps({"type": "session.finish", "event_id": f"event_{int(time.time() * 1000)}"})
-        drain = 0
+        drain = MODEL_CONFIG["qwen"]["drain_seconds"]
 
     if not api_key:
         await browser.send_json({"kind": "status", "type": "error", "raw": f"{keyname} not set on server"})
