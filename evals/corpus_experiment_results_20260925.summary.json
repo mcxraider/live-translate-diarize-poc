@@ -1,0 +1,26 @@
+{
+  "run_id": "20260925",
+  "qwen_model": "qwen3.8-livetranslate-flash-realtime",
+  "qwen_asr_model": "qwen3-asr-flash-realtime",
+  "gemini_model": "gemini-3.5-live-translate-preview",
+  "input_csv": "evals/corpus_experiment_input_rows_1_3_4.csv",
+  "results_csv": "evals/corpus_experiment_results_20260925.csv",
+  "aggregate": {
+    "sample_directions": 6,
+    "qwen_source_term_recall_before": 0.9514,
+    "qwen_source_term_recall_after": 0.9514,
+    "qwen_source_wer_before": 0.0417,
+    "qwen_source_wer_after": 0.0417,
+    "qwen_translation_term_recall_before": 0.8681,
+    "qwen_translation_term_recall_after": 0.8681,
+    "gemini_translation_term_recall": 0.8681,
+    "qwen_reference_wer_before": 0.3238,
+    "qwen_reference_wer_after": 0.3238,
+    "gemini_reference_wer": 0.3019,
+    "translation_term_recall_outcomes": {
+      "improved": 0,
+      "unchanged": 6,
+      "regressed": 0
+    }
+  }
+}

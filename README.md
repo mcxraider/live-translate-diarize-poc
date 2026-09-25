@@ -61,10 +61,15 @@ The required configuration is:
 
 Synthesis defaults to `gpt-4o-mini-tts`, the `cedar` voice, speed `1.0`, and a
 calm clinical delivery. See the stage-specific `--help` output for overrides.
+Gemini streams input and receives output concurrently so longer recordings do
+not starve the live connection. It sends two seconds of trailing silence before
+end-of-input by default; override this with `--gemini-trailing-silence` on
+`run-translations` or `run-pipeline`. `--gemini-drain` separately controls how
+long final output may continue to arrive after end-of-input.
 
-English WAVs are shared by `item_id` (for example `MED-001_en.wav`); translated
+English WAVs are shared by `item_id` (for example `EN-001_en.wav`); translated
 WAVs use the row's `pair_id` and `language_code` (for example
-`en-ms_MED-001_ms.wav`). Final files are 16 kHz, mono, 16-bit PCM for the live
+`en-ms-001_ms.wav`). Final files are 16 kHz, mono, 16-bit PCM for the live
 model evaluator. The generated voices are AI-generated, not human recordings.
 
 Each stage can also run independently:
@@ -122,3 +127,43 @@ Run the offline checks without credentials or network access:
 ```bash
 uv run evals/eval.py self-check
 ```
+
+### Cost benchmark
+
+Every cost-bearing command (`synthesize-audio`, `run-translations`,
+`judge-results`, and `run-pipeline`) ends with a terminal cost report. It shows
+both the API usage incurred by that CLI invocation and the estimated replacement
+cost of the complete selected workload, including work skipped because an audio
+file or checkpoint already exists. A full unfiltered pipeline contains 350
+deduplicated TTS calls, 630 Qwen translation calls, 630 Gemini translation calls,
+and 315 judge calls.
+
+Qwen, Gemini, and Router usage is taken from provider response metadata when it
+is available. TTS usage is estimated from the input text and generated WAV
+duration because the speech endpoint returns binary audio without per-request
+usage. Restored checkpoint work is also estimated because usage is deliberately
+not persisted. The report labels provider-reported, estimated, mixed, and
+lower-bound totals separately.
+
+The built-in rates are public USD list prices as of 2026-09-25: [Qwen 3.8
+LiveTranslate](https://www.alibabacloud.com/help/en/model-studio/model-pricing),
+[Gemini 3.5 Live Translate](https://ai.google.dev/gemini-api/docs/pricing),
+[GPT-4o Mini TTS](https://developers.openai.com/api/docs/models/gpt-4o-mini-tts),
+and [Claude Opus 5](https://www.anthropic.com/news/claude-opus-5). They exclude
+free quotas, credits, negotiated discounts, Router markup, tax, and currency
+conversion. Override rates for a negotiated contract or different region with:
+
+```text
+EVAL_COST_QWEN_AUDIO_INPUT_USD_PER_MTOK
+EVAL_COST_QWEN_TEXT_OUTPUT_USD_PER_MTOK
+EVAL_COST_QWEN_AUDIO_OUTPUT_USD_PER_MTOK
+EVAL_COST_GEMINI_INPUT_USD_PER_MTOK
+EVAL_COST_GEMINI_OUTPUT_USD_PER_MTOK
+EVAL_COST_TTS_TEXT_INPUT_USD_PER_MTOK
+EVAL_COST_TTS_AUDIO_OUTPUT_USD_PER_MTOK
+EVAL_COST_JUDGE_INPUT_USD_PER_MTOK
+EVAL_COST_JUDGE_OUTPUT_USD_PER_MTOK
+```
+
+Each override is a finite, non-negative USD price per million tokens. The Qwen
+3.8 source transcript is included with LiveTranslate at no extra ASR charge.
